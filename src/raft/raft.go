@@ -18,6 +18,9 @@ package raft
 //
 
 import (
+	"6.824/labgob"
+	"bytes"
+	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -98,44 +101,35 @@ func (rf *Raft) GetState() (int, bool) {
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
-	//rf.mu.Lock()
-	//defer rf.mu.Unlock()
-	//
-	//w := new(bytes.Buffer)
-	//e := labgob.NewEncoder(w)
-	//e.Encode(rf.currentTerm)
-	//e.Encode(rf.votedFor)
-	//e.Encode(rf.logs)
-	//
-	//data := w.Bytes()
-	//rf.persister.SaveRaftState(data)
-	//return
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
+	return
 }
 
 //
 // restore previously persisted state.
 //
 func (rf *Raft) readPersist(data []byte) {
-	//rf.mu.Lock()
-	//defer rf.mu.Unlock()
-	//if data == nil || len(data) < 1 { // bootstrap without any state?
-	//	return
-	//}
-	//
-	//r := bytes.NewBuffer(data)
-	//d := labgob.NewDecoder(r)
-	//var currentTerm int
-	//var votedFor int
-	//var logs []LogEntries
-	//if d.Decode(&currentTerm) != nil ||
-	//	d.Decode(&votedFor) != nil || d.Decode(&logs) != nil {
-	//	fmt.Println("error")
-	//} else {
-	//	rf.currentTerm = currentTerm
-	//	rf.votedFor = votedFor
-	//	rf.logs = logs
-	//}
-	//return
+
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	if d.Decode(&rf.currentTerm) != nil ||
+		d.Decode(&rf.votedFor) != nil || d.Decode(&rf.logs) != nil {
+		fmt.Println("error")
+	}
+	return
 }
 
 //
@@ -226,6 +220,8 @@ func (rf *Raft) IsUpToDate(args *RequestVoteArgs) bool {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
+	defer rf.persist()
+
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
@@ -244,6 +240,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
@@ -314,6 +311,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs) {
 		rf.status = "follower"
 		rf.currentTerm = reply.Term
 		rf.votedFor = -1
+		rf.persist()
 		return
 	}
 	if reply.Success {
@@ -376,6 +374,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs) {
 		rf.currentTerm = reply.Term
 		rf.status = "follower"
 		rf.votedFor = -1
+		rf.persist()
 	}
 
 	if reply.VoteGranted {
@@ -425,6 +424,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	rf.logs = append(rf.logs, LogEntries{command, rf.currentTerm})
+	rf.persist()
 
 	return len(rf.logs) - 1, rf.currentTerm, true
 }
@@ -538,6 +538,7 @@ func (rf *Raft) startElection() {
 	rf.votedFor = rf.me
 	rf.voteCount = 1
 	rf.currentTerm += 1
+	rf.persist()
 	args := RequestVoteArgs{Term: rf.currentTerm, CandidateId: rf.me}
 	args.LastLogIndex = len(rf.logs) - 1
 	args.LastLogTerm = rf.logs[args.LastLogIndex].Term
