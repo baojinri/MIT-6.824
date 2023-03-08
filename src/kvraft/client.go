@@ -1,13 +1,19 @@
 package kvraft
 
-import "6.824/labrpc"
+import (
+	"6.824/labrpc"
+	"sync"
+)
 import "crypto/rand"
 import "math/big"
 
-
 type Clerk struct {
+	mu      sync.Mutex
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	ClientId int64
+	OpId     int
+	leaderId int
 }
 
 func nrand() int64 {
@@ -20,7 +26,7 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
-	// You'll have to add code here.
+	ck.ClientId = nrand()
 	return ck
 }
 
@@ -37,9 +43,11 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
-
-	// You will have to modify this function.
-	return ""
+	ck.mu.Lock()
+	ck.OpId++
+	ck.mu.Unlock()
+	value := ck.sendRequest(key, "", "Get")
+	return value
 }
 
 //
@@ -53,12 +61,56 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	// You will have to modify this function.
+	_ = ck.sendRequest(key, value, op)
+	return
 }
 
 func (ck *Clerk) Put(key string, value string) {
+	ck.mu.Lock()
+	ck.OpId++
+	ck.mu.Unlock()
 	ck.PutAppend(key, value, "Put")
+	return
 }
 func (ck *Clerk) Append(key string, value string) {
+	ck.mu.Lock()
+	ck.OpId++
+	ck.mu.Unlock()
 	ck.PutAppend(key, value, "Append")
+	return
+}
+
+func (ck *Clerk) sendRequest(key string, value string, op string) string {
+	for {
+		args := OpArgs{key, value, op, ck.ClientId, ck.OpId}
+		reply := OpReply{}
+		ok := ck.sendRPCRequest(ck.leaderId, &args, &reply)
+		if ok {
+			if reply.Err == OK {
+				//fmt.Println("0000")
+				//fmt.Println(reply.Value)
+				return reply.Value
+			} else if reply.Err == ErrNoKey {
+				//fmt.Println("1111")
+				return reply.Value
+			} else {
+				ck.mu.Lock()
+				ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+				ck.mu.Unlock()
+				//fmt.Println("3333")
+			}
+		} else {
+			ck.mu.Lock()
+			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+			ck.mu.Unlock()
+			//fmt.Println("4444")
+		}
+	}
+}
+
+func (ck *Clerk) sendRPCRequest(leaderId int, args *OpArgs, reply *OpReply) bool {
+
+	ok := ck.servers[leaderId].Call("KVServer.ClientRequest", args, reply)
+
+	return ok
 }

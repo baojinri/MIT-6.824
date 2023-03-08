@@ -7,6 +7,7 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const Debug = false
@@ -18,11 +19,12 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	Key      string
+	Value    string
+	ClientId int64
+	OpId     int
+	Op       string
 }
 
 type KVServer struct {
@@ -34,16 +36,100 @@ type KVServer struct {
 
 	maxraftstate int // snapshot if log grows this big
 
+	opId map[int64]int
+	data map[string]string
+	recv map[int]chan Op
+
 	// Your definitions here.
 }
 
+func (kv *KVServer) ClientRequest(args *OpArgs, reply *OpReply) {
+	kv.mu.Lock()
+	if kv.opId[args.ClientId] >= args.OpId {
+		if args.Op == "Get" {
+			if value, ok := kv.data[args.Key]; ok {
+				reply.Err = OK
+				reply.Value = value
+			} else {
+				reply.Err = ErrNoKey
+				reply.Value = ""
+			}
+			kv.mu.Unlock()
+			return
+		}
+	}
+	kv.mu.Unlock()
 
-func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	commend := Op{Key: args.Key, Value: args.Value, ClientId: args.ClientId, OpId: args.OpId, Op: args.Op}
+	index, _, isLeader := kv.rf.Start(commend)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	//fmt.Println(args)
+	kv.mu.Lock()
+	kv.recv[index] = make(chan Op)
+	kv.mu.Unlock()
+
+	select {
+	case item := <-kv.recv[index]:
+		if item.ClientId != args.ClientId || item.OpId != args.OpId {
+			reply.Err = ErrWrongLeader
+		} else {
+			if item.Op == "Get" {
+				kv.mu.Lock()
+				if value, ok := kv.data[item.Key]; ok {
+					reply.Err = OK
+					reply.Value = value
+				} else {
+					//fmt.Println("<<<<<<")
+					reply.Err = ErrNoKey
+					reply.Value = ""
+				}
+				kv.mu.Unlock()
+			} else {
+				reply.Err = OK
+			}
+		}
+	case <-time.After(time.Second):
+		reply.Err = ErrWrongLeader
+	}
+
+	kv.mu.Lock()
+	close(kv.recv[index])
+	delete(kv.recv, index)
+	kv.mu.Unlock()
+
+	return
 }
 
-func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+func (kv *KVServer) upDate() {
+	for kv.killed() == false {
+		select {
+		case item := <-kv.applyCh:
+			if item.CommandValid {
+				kv.mu.Lock()
+				op := item.Command.(Op)
+				if op.OpId > kv.opId[op.ClientId] {
+					kv.opId[op.ClientId] = op.OpId
+					//fmt.Println(kv.opId[op.ClientId])
+					//fmt.Println(op.Key)
+					switch op.Op {
+					case "Put":
+						//fmt.Println(op.Value)
+						kv.data[op.Key] = op.Value
+					case "Append":
+						//fmt.Println(op.Value)
+						kv.data[op.Key] += op.Value
+					}
+				}
+				if _, ok := kv.recv[item.CommandIndex]; ok {
+					kv.recv[item.CommandIndex] <- op
+				}
+				kv.mu.Unlock()
+			}
+		}
+	}
 }
 
 //
@@ -90,12 +176,13 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.me = me
 	kv.maxraftstate = maxraftstate
 
-	// You may need initialization code here.
-
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
-	// You may need initialization code here.
+	kv.data = make(map[string]string)
+	kv.opId = make(map[int64]int)
+	kv.recv = make(map[int]chan Op)
+	go kv.upDate()
 
 	return kv
 }
