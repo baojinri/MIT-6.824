@@ -87,8 +87,6 @@ func (ck *Clerk) sendRequest(key string, value string, op string) string {
 		ok := ck.sendRPCRequest(ck.leaderId, &args, &reply)
 		if ok {
 			if reply.Err == OK {
-				//fmt.Println("0000")
-				//fmt.Println(reply.Value)
 				return reply.Value
 			} else if reply.Err == ErrNoKey {
 				//fmt.Println("1111")
@@ -97,13 +95,11 @@ func (ck *Clerk) sendRequest(key string, value string, op string) string {
 				ck.mu.Lock()
 				ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
 				ck.mu.Unlock()
-				//fmt.Println("3333")
 			}
 		} else {
 			ck.mu.Lock()
 			ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
 			ck.mu.Unlock()
-			//fmt.Println("4444")
 		}
 	}
 }

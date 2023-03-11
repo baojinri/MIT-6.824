@@ -4,6 +4,7 @@ import (
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -40,6 +41,8 @@ type KVServer struct {
 	data map[string]string
 	recv map[int]chan Op
 
+	lastIndex int
+
 	// Your definitions here.
 }
 
@@ -66,7 +69,6 @@ func (kv *KVServer) ClientRequest(args *OpArgs, reply *OpReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	//fmt.Println(args)
 	kv.mu.Lock()
 	kv.recv[index] = make(chan Op)
 	kv.mu.Unlock()
@@ -82,7 +84,6 @@ func (kv *KVServer) ClientRequest(args *OpArgs, reply *OpReply) {
 					reply.Err = OK
 					reply.Value = value
 				} else {
-					//fmt.Println("<<<<<<")
 					reply.Err = ErrNoKey
 					reply.Value = ""
 				}
@@ -109,27 +110,59 @@ func (kv *KVServer) upDate() {
 		case item := <-kv.applyCh:
 			if item.CommandValid {
 				kv.mu.Lock()
+				if item.CommandIndex <= kv.lastIndex {
+					kv.mu.Unlock()
+					continue
+				}
+				kv.lastIndex = item.CommandIndex
+
 				op := item.Command.(Op)
 				if op.OpId > kv.opId[op.ClientId] {
 					kv.opId[op.ClientId] = op.OpId
-					//fmt.Println(kv.opId[op.ClientId])
-					//fmt.Println(op.Key)
 					switch op.Op {
 					case "Put":
-						//fmt.Println(op.Value)
 						kv.data[op.Key] = op.Value
 					case "Append":
-						//fmt.Println(op.Value)
 						kv.data[op.Key] += op.Value
 					}
 				}
+
 				if _, ok := kv.recv[item.CommandIndex]; ok {
 					kv.recv[item.CommandIndex] <- op
+				}
+
+				if kv.maxraftstate != -1 && kv.rf.Need(kv.maxraftstate) {
+					w := new(bytes.Buffer)
+					e := labgob.NewEncoder(w)
+					e.Encode(kv.data)
+					e.Encode(kv.opId)
+					kv.rf.Snapshot(kv.lastIndex, w.Bytes())
+				}
+				
+				kv.mu.Unlock()
+			}
+			if item.SnapshotValid {
+				kv.mu.Lock()
+				if kv.rf.CondInstallSnapshot(item.SnapshotTerm, item.SnapshotIndex, item.Snapshot) {
+					kv.lastIndex = item.SnapshotIndex
+					kv.saveSnapShot(item.Snapshot)
 				}
 				kv.mu.Unlock()
 			}
 		}
 	}
+}
+
+func (kv *KVServer) saveSnapShot(snapshot []byte) {
+	if snapshot == nil || len(snapshot) == 0 {
+		return
+	}
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	if d.Decode(&kv.data) != nil ||
+		d.Decode(&kv.opId) != nil {
+	}
+	return
 }
 
 //
@@ -182,6 +215,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.data = make(map[string]string)
 	kv.opId = make(map[int64]int)
 	kv.recv = make(map[int]chan Op)
+	kv.lastIndex = 0
+	kv.saveSnapShot(persister.ReadSnapshot())
 	go kv.upDate()
 
 	return kv

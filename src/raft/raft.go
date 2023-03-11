@@ -158,29 +158,30 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 		return false
 	}
 
-	if lastIncludedIndex > len(rf.logs)-1+rf.lastIncludeIndex {
-		rf.logs = append([]LogEntries(nil), LogEntries{Term: lastIncludedTerm})
+	var newLog []LogEntries
+	newLog = append(newLog, LogEntries{Term: lastIncludedTerm})
+
+	if lastIncludedIndex >= len(rf.logs)-1+rf.lastIncludeIndex {
+		if rf.commitIndex < lastIncludedIndex {
+			rf.commitIndex = lastIncludedIndex
+		}
+	} else if rf.logs[lastIncludedIndex-rf.lastIncludeIndex].Term != lastIncludedTerm {
+		rf.commitIndex = lastIncludedIndex
 	} else {
-		rf.logs = rf.logs[lastIncludedIndex-rf.lastIncludeIndex:]
-		rf.logs[0].Command = nil
+		newLog = append(newLog, rf.logs[lastIncludedIndex+1-rf.lastIncludeIndex:]...)
+		if rf.commitIndex < lastIncludedIndex {
+			rf.commitIndex = lastIncludedIndex
+		}
 	}
-
-	rf.commitIndex = lastIncludedIndex
-	rf.lastApplied = lastIncludedIndex
-
+	rf.logs = newLog
 	rf.lastIncludeIndex = lastIncludedIndex
 	rf.lastIncludeTerm = lastIncludedTerm
-	rf.logs[0].Term = rf.lastIncludeTerm
+	rf.lastApplied = lastIncludedIndex
 
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	e.Encode(rf.currentTerm)
-	e.Encode(rf.votedFor)
-	e.Encode(rf.logs)
-	e.Encode(rf.lastIncludeIndex)
-	e.Encode(rf.lastIncludeTerm)
-	data := w.Bytes()
-	rf.persister.SaveStateAndSnapshot(data, snapshot)
+	rf.persist()
+	rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), snapshot)
+
+	go rf.ApplyMsg()
 
 	return true
 }
@@ -210,15 +211,11 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 	rf.lastIncludeIndex = index
 
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	e.Encode(rf.currentTerm)
-	e.Encode(rf.votedFor)
-	e.Encode(rf.logs)
-	e.Encode(rf.lastIncludeIndex)
-	e.Encode(rf.lastIncludeTerm)
-	data := w.Bytes()
-	rf.persister.SaveStateAndSnapshot(data, snapshot)
+	rf.persist()
+	rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), snapshot)
+
+	go rf.ApplyMsg()
+
 	return
 }
 
@@ -241,7 +238,6 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	reply.Term = rf.currentTerm
 
 	if args.Term < rf.currentTerm {
-		rf.mu.Unlock()
 		return
 	}
 
@@ -252,11 +248,12 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.heartbeat <- true
 	rf.persist()
 
-	if args.LastIncludeIndex > rf.lastIncludeIndex {
-		go func() {
-			rf.applyCh <- ApplyMsg{SnapshotValid: true, Snapshot: args.Data, SnapshotTerm: args.LastIncludeTerm, SnapshotIndex: args.LastIncludeIndex}
-		}()
+	if args.LastIncludeIndex <= rf.lastIncludeIndex {
+		return
 	}
+
+	rf.applyCh <- ApplyMsg{SnapshotValid: true, Snapshot: args.Data, SnapshotTerm: args.LastIncludeTerm, SnapshotIndex: args.LastIncludeIndex}
+
 	return
 }
 
@@ -312,8 +309,8 @@ func (rf *Raft) ApplyMsg() {
 }
 
 func (rf *Raft) IsUpToDate(args *RequestVoteArgs) bool {
-	lastIndex := len(rf.logs) - 1
-	lastTerm := rf.logs[lastIndex].Term
+	lastIndex := len(rf.logs) - 1 + rf.lastIncludeIndex
+	lastTerm := rf.logs[lastIndex-rf.lastIncludeIndex].Term
 	if lastTerm == args.LastLogTerm {
 		return args.LastLogIndex >= lastIndex
 	} else {
@@ -529,15 +526,12 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs) {
 			rf.status = "leader"
 			rf.nextIndex = make([]int, len(rf.peers))
 			rf.matchIndex = make([]int, len(rf.peers))
-			//fmt.Println(len(rf.logs))
 
 			for i := 0; i < len(rf.peers); i++ {
-				rf.nextIndex[i] = len(rf.logs)
+				rf.nextIndex[i] = len(rf.logs) + rf.lastIncludeIndex
 				rf.matchIndex[i] = 0
 			}
 			rf.winElection <- true
-
-			//go rf.heartBeat()
 
 		}
 	}
@@ -569,7 +563,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.logs = append(rf.logs, LogEntries{command, rf.currentTerm})
 	rf.persist()
 
-	return len(rf.logs) - 1, rf.currentTerm, true
+	return len(rf.logs) - 1 + rf.lastIncludeIndex, rf.currentTerm, true
 }
 
 //
@@ -686,8 +680,8 @@ func (rf *Raft) startElection() {
 	rf.currentTerm += 1
 	rf.persist()
 	args := RequestVoteArgs{Term: rf.currentTerm, CandidateId: rf.me}
-	args.LastLogIndex = len(rf.logs) - 1
-	args.LastLogTerm = rf.logs[args.LastLogIndex].Term
+	args.LastLogIndex = len(rf.logs) - 1 + rf.lastIncludeIndex
+	args.LastLogTerm = rf.logs[args.LastLogIndex-rf.lastIncludeIndex].Term
 	rf.mu.Unlock()
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
@@ -696,6 +690,10 @@ func (rf *Raft) startElection() {
 		go rf.sendRequestVote(i, &args)
 	}
 	return
+}
+
+func (rf *Raft) Need(size int) bool {
+	return rf.persister.RaftStateSize() >= size
 }
 
 //
@@ -738,6 +736,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.ticker()
 
 	return rf
+}
+
+func (rf *Raft) shouldSnapShot(size int) bool {
+	return rf.persister.RaftStateSize() >= size
 }
 
 func randTime() time.Duration {
