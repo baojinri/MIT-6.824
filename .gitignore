@@ -2,3 +2,6 @@ pkg/
 api.key
 .api.key.trimmed
 *-handin.tar.gz
+.idea
+.Ds_store
+*.txt

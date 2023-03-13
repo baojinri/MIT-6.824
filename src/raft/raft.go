@@ -622,7 +622,7 @@ func (rf *Raft) ticker() {
 			}
 		case "leader":
 			select {
-			case <-time.After(120 * time.Millisecond):
+			case <-time.After(20 * time.Millisecond):
 				go rf.heartBeat()
 			}
 		}
