@@ -41,39 +41,39 @@ type ShardKV struct {
 
 	data map[int]*Shard
 	recv map[int]chan RaftLogCommand
+	OpId map[int64]int
 
 	lastIndex int
-
-	// Your definitions here.
 }
 
 type Shard struct {
-	status string // valid，invalid，wait
-	kv     map[string]string
-	opId   map[int64]int
+	Status string // valid，invalid，wait
+	Kv     map[string]string
 }
 
 func (kv *ShardKV) ClientRequest(args *OpArgs, reply *OpReply) {
 	shard := key2shard(args.Key)
 
-	if kv.currConfig.Shards[shard] != kv.gid || kv.data[shard].status != "valid" {
+	if kv.currConfig.Shards[shard] != kv.gid || kv.data[shard].Status != "valid" {
 		reply.Err = ErrWrongGroup
 		return
 	}
 
 	kv.mu.Lock()
-	if kv.data[shard].opId[args.ClientId] >= args.OpId {
+	if kv.OpId[args.ClientId] >= args.OpId {
 		if args.Op == "Get" {
-			if value, ok := kv.data[shard].kv[args.Key]; ok {
+			if value, ok := kv.data[shard].Kv[args.Key]; ok {
 				reply.Err = OK
 				reply.Value = value
 			} else {
 				reply.Err = ErrNoKey
 				reply.Value = ""
 			}
-			kv.mu.Unlock()
-			return
+		} else {
+			reply.Err = OK
 		}
+		kv.mu.Unlock()
+		return
 	}
 	kv.mu.Unlock()
 
@@ -97,7 +97,7 @@ func (kv *ShardKV) ClientRequest(args *OpArgs, reply *OpReply) {
 		} else {
 			if item.Op == "Get" {
 				kv.mu.Lock()
-				if value, ok := kv.data[key2shard(item.Key)].kv[item.Key]; ok {
+				if value, ok := kv.data[key2shard(item.Key)].Kv[item.Key]; ok {
 					reply.Err = OK
 					reply.Value = value
 				} else {
@@ -117,7 +117,21 @@ func (kv *ShardKV) ClientRequest(args *OpArgs, reply *OpReply) {
 	close(kv.recv[index])
 	delete(kv.recv, index)
 	kv.mu.Unlock()
+	return
+}
 
+func (kv *ShardKV) applyOp(command *RaftLogCommand) {
+	op := command.Command.(Op)
+	shard := key2shard(op.Key)
+	if op.OpId > kv.OpId[op.ClientId] {
+		kv.OpId[op.ClientId] = op.OpId
+		switch op.Op {
+		case "Put":
+			kv.data[shard].Kv[op.Key] = op.Value
+		case "Append":
+			kv.data[shard].Kv[op.Key] += op.Value
+		}
+	}
 	return
 }
 
@@ -126,68 +140,47 @@ func (kv *ShardKV) config() {
 	kv.mu.Lock()
 	currConfNum := kv.currConfig.Num
 	for _, shard := range kv.data {
-		if shard.status == "wait" {
+		if shard.Status == "wait" {
 			canFetchConf = false
 			break
 		}
 	}
-
 	kv.mu.Unlock()
+
 	if canFetchConf {
 		latestConfig := kv.sm.Query(currConfNum + 1)
 		if latestConfig.Num == currConfNum+1 {
 			kv.rf.Start(newRaftLogCommand("config", latestConfig))
 		}
 	}
-
-}
-
-func (kv *ShardKV) shard() {
-	kv.mu.Lock()
-	shards := make([]int, 0)
-	for shardId, shard := range kv.data {
-		if shard.status == "wait" {
-			shards = append(shards, shardId)
-		}
-	}
-
-	kv.mu.Unlock()
-	if len(shards) != 0 {
-		kv.rf.Start(newRaftLogCommand("shard", shards))
-	}
-}
-
-func (kv *ShardKV) applyOp(command *RaftLogCommand) {
-	op := command.Command.(Op)
-	shard := key2shard(op.Key)
-	if op.OpId > kv.data[shard].opId[op.ClientId] {
-		kv.data[shard].opId[op.ClientId] = op.OpId
-		switch op.Op {
-		case "Put":
-			kv.data[shard].kv[op.Key] = op.Value
-		case "Append":
-			kv.data[shard].kv[op.Key] += op.Value
-		}
-	}
-	return
 }
 
 func (kv *ShardKV) applyConfig(command *RaftLogCommand) {
 	config := command.Command.(shardctrler.Config)
 	if config.Num == kv.currConfig.Num+1 {
+		//fmt.Println(config)
 		for i := 0; i < shardctrler.NShards; i++ {
-			if kv.data[i].status == "valid" {
-				kv.data[i].status = ""
+			if kv.data[i].Status == "valid" {
+				kv.data[i].Status = ""
 			}
 		}
 		for shardID, gid := range config.Shards {
 			if gid == kv.gid {
-				if kv.data[shardID].status == "invalid" {
-					kv.data[shardID].status = "wait"
+				if kv.data[shardID].Status == "invalid" {
+					if kv.currConfig.Num == 0 {
+						kv.data[shardID].Status = "valid"
+					} else {
+						kv.data[shardID].Status = "wait"
+					}
 				}
-				if kv.data[shardID].status == "" {
-					kv.data[shardID].status = "valid"
+				if kv.data[shardID].Status == "" {
+					kv.data[shardID].Status = "valid"
 				}
+			}
+		}
+		for i := 0; i < shardctrler.NShards; i++ {
+			if kv.data[i].Status == "" {
+				kv.data[i].Status = "invalid"
 			}
 		}
 		kv.prevConfig = kv.currConfig
@@ -206,20 +199,23 @@ type ShardOperationResponse struct {
 	Data map[int]map[string]string
 }
 
-func (kv *ShardKV) applyShard(command *RaftLogCommand) {
-	shards := command.Command.([]int)
-	prevConfig := kv.prevConfig
-	if prevConfig.Num == 0 {
-		for _, shardId := range shards {
-			kv.data[shardId].status = "valid"
+func (kv *ShardKV) shard() {
+	kv.mu.Lock()
+	shards := make([]int, 0)
+	for shardId, shard := range kv.data {
+		if shard.Status == "wait" {
+			shards = append(shards, shardId)
 		}
+	}
+
+	if len(shards) == 0 {
+		kv.mu.Unlock()
 		return
 	}
 	gid2shardIDs := make(map[int][]int)
 	for _, shardId := range shards {
-		gid2shardIDs[prevConfig.Shards[shardId]] = append(gid2shardIDs[prevConfig.Shards[shardId]], shardId)
+		gid2shardIDs[kv.prevConfig.Shards[shardId]] = append(gid2shardIDs[kv.prevConfig.Shards[shardId]], shardId)
 	}
-
 	var wg sync.WaitGroup
 	for gid, shardIDs := range gid2shardIDs {
 		wg.Add(1)
@@ -230,14 +226,12 @@ func (kv *ShardKV) applyShard(command *RaftLogCommand) {
 				var pullTaskResponse ShardOperationResponse
 				srv := kv.make_end(server)
 				if srv.Call("ShardKV.GetShardsData", &pullTaskRequest, &pullTaskResponse) && pullTaskResponse.Err == OK {
-					for _, shardId := range shardIDs {
-						kv.data[shardId].kv = deepCopy(pullTaskResponse.Data[shardId])
-						kv.data[shardId].status = "valid"
-					}
+					kv.rf.Start(newRaftLogCommand("shard", pullTaskResponse))
 				}
 			}
-		}(prevConfig.Groups[gid], kv.currConfig.Num, shardIDs)
+		}(kv.prevConfig.Groups[gid], kv.currConfig.Num, shardIDs)
 	}
+	kv.mu.Unlock()
 	wg.Wait()
 	return
 }
@@ -257,7 +251,7 @@ func (kv *ShardKV) GetShardsData(request *ShardOperationRequest, response *Shard
 
 	response.Data = make(map[int]map[string]string)
 	for _, shardID := range request.Shards {
-		response.Data[shardID] = deepCopy(kv.data[shardID].kv)
+		response.Data[shardID] = deepCopy(kv.data[shardID].Kv)
 	}
 
 	response.Err = OK
@@ -265,8 +259,17 @@ func (kv *ShardKV) GetShardsData(request *ShardOperationRequest, response *Shard
 	return
 }
 
+func (kv *ShardKV) applyShard(command *RaftLogCommand) {
+	shards := command.Command.(ShardOperationResponse)
+	for shardId, shard := range shards.Data {
+		kv.data[shardId].Kv = deepCopy(shard)
+		kv.data[shardId].Status = "valid"
+	}
+	return
+}
+
 func (kv *ShardKV) apply() {
-	for {
+	for !kv.killed() {
 		select {
 		case item := <-kv.applyCh:
 			if item.CommandValid {
@@ -291,13 +294,13 @@ func (kv *ShardKV) apply() {
 					kv.recv[item.CommandIndex] <- command
 				}
 
-				if kv.maxraftstate != -1 && kv.rf.Need(kv.maxraftstate) {
+				if kv.rf.Need(kv.maxraftstate) {
 					w := new(bytes.Buffer)
 					e := labgob.NewEncoder(w)
 					e.Encode(kv.data)
+					e.Encode(kv.OpId)
 					kv.rf.Snapshot(kv.lastIndex, w.Bytes())
 				}
-
 				kv.mu.Unlock()
 			}
 			if item.SnapshotValid {
@@ -318,7 +321,7 @@ func (kv *ShardKV) saveSnapShot(snapshot []byte) {
 	}
 	r := bytes.NewBuffer(snapshot)
 	d := labgob.NewDecoder(r)
-	if d.Decode(&kv.data) != nil {
+	if d.Decode(&kv.data) != nil || d.Decode(&kv.OpId) != nil {
 	}
 	return
 }
@@ -345,6 +348,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	labgob.Register(Op{})
 	labgob.Register(RaftLogCommand{})
 	labgob.Register(shardctrler.Config{})
+	labgob.Register(ShardOperationResponse{})
+	labgob.Register(Shard{})
 
 	kv := new(ShardKV)
 	kv.me = me
@@ -358,16 +363,18 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// Use something like this to talk to the shardctrler:
 	kv.sm = shardctrler.MakeClerk(kv.ctrlers)
 	kv.prevConfig = shardctrler.Config{}
-	kv.currConfig = shardctrler.Config{}
+	kv.currConfig = kv.sm.Query(-1)
+	kv.currConfig.Num = 0
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	kv.data = make(map[int]*Shard, shardctrler.NShards)
+	kv.OpId = make(map[int64]int)
+
 	for i := 0; i < shardctrler.NShards; i++ {
-		kv.data[i] = &Shard{status: "invalid"}
-		kv.data[i].opId = make(map[int64]int)
-		kv.data[i].kv = make(map[string]string)
+		kv.data[i] = &Shard{Status: "invalid"}
+		kv.data[i].Kv = make(map[string]string)
 	}
 	kv.recv = make(map[int]chan RaftLogCommand)
 	kv.lastIndex = 0

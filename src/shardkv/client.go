@@ -75,7 +75,7 @@ func (ck *Clerk) Get(key string) string {
 	ck.mu.Lock()
 	ck.OpId++
 	ck.mu.Unlock()
-	return ck.sendRequest(key, "", "Put")
+	return ck.sendRequest(key, "", "Get")
 }
 
 func (ck *Clerk) Put(key string, value string) {
