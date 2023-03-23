@@ -158,7 +158,6 @@ func (kv *ShardKV) config() {
 func (kv *ShardKV) applyConfig(command *RaftLogCommand) {
 	config := command.Command.(shardctrler.Config)
 	if config.Num == kv.currConfig.Num+1 {
-		//fmt.Println(config)
 		for i := 0; i < shardctrler.NShards; i++ {
 			if kv.data[i].Status == "valid" {
 				kv.data[i].Status = ""
@@ -196,7 +195,9 @@ type ShardOperationRequest struct {
 
 type ShardOperationResponse struct {
 	Err
-	Data map[int]map[string]string
+	Data      map[int]map[string]string
+	ConfigNum int
+	OpId      map[int64]int
 }
 
 func (kv *ShardKV) shard() {
@@ -254,6 +255,13 @@ func (kv *ShardKV) GetShardsData(request *ShardOperationRequest, response *Shard
 		response.Data[shardID] = deepCopy(kv.data[shardID].Kv)
 	}
 
+	response.OpId = make(map[int64]int)
+	for clientId, opId := range kv.OpId {
+		response.OpId[clientId] = opId
+	}
+
+	response.ConfigNum = request.ConfigNum
+
 	response.Err = OK
 
 	return
@@ -261,9 +269,18 @@ func (kv *ShardKV) GetShardsData(request *ShardOperationRequest, response *Shard
 
 func (kv *ShardKV) applyShard(command *RaftLogCommand) {
 	shards := command.Command.(ShardOperationResponse)
-	for shardId, shard := range shards.Data {
-		kv.data[shardId].Kv = deepCopy(shard)
-		kv.data[shardId].Status = "valid"
+
+	if shards.ConfigNum == kv.currConfig.Num {
+		for shardId, shard := range shards.Data {
+			kv.data[shardId].Kv = deepCopy(shard)
+			kv.data[shardId].Status = "valid"
+		}
+
+		for clientId, opId := range shards.OpId {
+			if lastOperation, ok := kv.OpId[clientId]; !ok || lastOperation < opId {
+				kv.OpId[clientId] = opId
+			}
+		}
 	}
 	return
 }
@@ -294,11 +311,13 @@ func (kv *ShardKV) apply() {
 					kv.recv[item.CommandIndex] <- command
 				}
 
-				if kv.rf.Need(kv.maxraftstate) {
+				if kv.rf.Need(kv.maxraftstate) && kv.maxraftstate != -1 {
 					w := new(bytes.Buffer)
 					e := labgob.NewEncoder(w)
 					e.Encode(kv.data)
 					e.Encode(kv.OpId)
+					e.Encode(kv.prevConfig)
+					e.Encode(kv.currConfig)
 					kv.rf.Snapshot(kv.lastIndex, w.Bytes())
 				}
 				kv.mu.Unlock()
@@ -321,7 +340,7 @@ func (kv *ShardKV) saveSnapShot(snapshot []byte) {
 	}
 	r := bytes.NewBuffer(snapshot)
 	d := labgob.NewDecoder(r)
-	if d.Decode(&kv.data) != nil || d.Decode(&kv.OpId) != nil {
+	if d.Decode(&kv.data) != nil || d.Decode(&kv.OpId) != nil || d.Decode(&kv.prevConfig) != nil || d.Decode(&kv.currConfig) != nil {
 	}
 	return
 }
